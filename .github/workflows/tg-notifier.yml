@@ -26,7 +26,7 @@ jobs:
           LOGIN_USER: taras
           LOGIN_PASS: d9Pc8t*KcxTen5n 
           # целевая страница отчёта (весь твой URL с #!/reports/favourite/104/?s=~(...))
-          PAGE_URL: https://trident.partners/admin/#!/reports/favourite/104/?s=~(grouping~(~'campaign~'sub_id_6~'sub_id_5~'sub_id_4~'country_flag)~metrics~(~'clicks~'campaign_unique_clicks~'leads~'sales~'cpa~'roi_confirmed~'cost)~limit~100~columns~(~)~filters~(~)~range~(interval~'today~timezone~'Europe*2fKyiv)~sort~(~'cost~'desc)~resized_columns~(sub_id_4~125.00000762939453))
+          PAGE_URL: "https://trident.partners/admin/#!/reports/favourite/104/?s=~(grouping~(~'campaign~'sub_id_6~'sub_id_5~'sub_id_4~'country_flag)~metrics~(~'clicks~'campaign_unique_clicks~'leads~'sales~'cpa~'roi_confirmed~'cost)~limit~100~columns~(~)~filters~(~)~range~(interval~'today~timezone~'Europe*2fKyiv)~sort~(~'cost~'desc)~resized_columns~(sub_id_4~125.00000762939453))"
           # телега
           TELEGRAM_BOT_TOKEN: 8314727651:AAF_X4k8zhVp9rAZHhTJYij5otElSzH5RbM 
           TELEGRAM_CHAT_ID: 553646113
