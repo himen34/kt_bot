@@ -1,5 +1,4 @@
 name: tg-notifier
-
 on:
   schedule:
     - cron: "*/5 * * * *"
@@ -7,10 +6,22 @@ on:
 
 jobs:
   run:
-    runs-on: ubuntu-22.04   # ✅ фикс: используем jammy, а не noble
+    runs-on: ubuntu-22.04
+    env:
+      LOGIN_USER: ${{ secrets.LOGIN_USER }}
+      LOGIN_PASS: ${{ secrets.LOGIN_PASS }}
+      PAGE_URL:  ${{ secrets.PAGE_URL }}
+      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+      TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+      GIST_ID: ${{ secrets.GIST_ID }}
+      GIST_TOKEN: ${{ secrets.GIST_TOKEN }}
+      GIST_FILENAME: keitaro_spend_state.json
+      SPEND_ABS_THRESHOLD: ${{ secrets.SPEND_ABS_THRESHOLD }}
+      SPEND_PCT_THRESHOLD: ${{ secrets.SPEND_PCT_THRESHOLD }}
+      SPEND_DIRECTION: ${{ secrets.SPEND_DIRECTION }}
+
     steps:
       - uses: actions/checkout@v4
-
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
@@ -19,35 +30,18 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
-          # ставим Chromium + системные зависимости через python
           python -m playwright install --with-deps chromium
 
       - name: Check required env
         run: |
           python - <<'PY'
           import os, sys
-          need=["LOGIN_USER","LOGIN_PASS","PAGE_URL","TELEGRAM_BOT_TOKEN","TELEGRAM_CHAT_ID","GIST_ID","GIST_TOKEN"]
-          miss=[k for k in need if not os.getenv(k)]
-          if miss: print("❌ Missing:",", ".join(miss)); sys.exit(1)
+          required = ["LOGIN_USER","LOGIN_PASS","PAGE_URL","TELEGRAM_BOT_TOKEN","TELEGRAM_CHAT_ID","GIST_ID","GIST_TOKEN"]
+          missing = [k for k in required if not os.getenv(k)]
+          if missing:
+              print("❌ Missing secrets:", ", ".join(missing)); sys.exit(1)
           print("✅ All secrets are set.")
           PY
 
       - name: Run notifier
         run: python notifier_playwright.py
-        env:
-          # вход
-          LOGIN_USER: taras
-          LOGIN_PASS: d9Pc8t*KcxTen5n 
-          # целевая страница отчёта (весь твой URL с #!/reports/favourite/104/?s=~(...))
-          PAGE_URL: "https://trident.partners/admin/#!/reports/favourite/104/?s=~(grouping~(~'campaign~'sub_id_6~'sub_id_5~'sub_id_4~'country_flag)~metrics~(~'clicks~'campaign_unique_clicks~'leads~'sales~'cpa~'roi_confirmed~'cost)~limit~100~columns~(~)~filters~(~)~range~(interval~'today~timezone~'Europe*2fKyiv)~sort~(~'cost~'desc)~resized_columns~(sub_id_4~125.00000762939453))"
-          # телега
-          TELEGRAM_BOT_TOKEN: 8314727651:AAF_X4k8zhVp9rAZHhTJYij5otElSzH5RbM 
-          TELEGRAM_CHAT_ID: 553646113
-          # хранение состояния
-          GIST_ID: 13cc7dd89a830c47546846aaa6d8a0c3 
-          GIST_TOKEN: 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 
-          GIST_FILENAME: keitaro_spend_state.json
-          # пороги
-          SPEND_ABS_THRESHOLD: 80  # напр. 100
-          SPEND_PCT_THRESHOLD: 30   # напр. 40
-          SPEND_DIRECTION: up         # up|down|both
