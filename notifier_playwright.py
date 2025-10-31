@@ -1,182 +1,214 @@
-import os, json, re, requests
+import os, re, json, time, math
+from typing import List, Dict, Any, Tuple
+import requests
 from playwright.sync_api import sync_playwright
 
 LOGIN_URL = "https://trident.partners/admin/"
-PAGE_URL  = os.environ["PAGE_URL"]  # твой favourite/104/... полный URL
 LOGIN_USER = os.environ["LOGIN_USER"]
 LOGIN_PASS = os.environ["LOGIN_PASS"]
+PAGE_URL  = os.environ["PAGE_URL"]
 
-TG_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
-TG_CHAT  = os.environ["TELEGRAM_CHAT_ID"]
+TG_TOKEN  = os.environ["TELEGRAM_BOT_TOKEN"]
+TG_CHAT   = os.environ["TELEGRAM_CHAT_ID"]
 
-ABS_THR = float(os.getenv("SPEND_ABS_THRESHOLD", "50"))
-PCT_THR = float(os.getenv("SPEND_PCT_THRESHOLD", "50"))
-DIRECTION = os.getenv("SPEND_DIRECTION", "up").lower()  # up|down|both
-
-GIST_ID = os.environ["GIST_ID"]
-GIST_TOKEN = os.environ["GIST_TOKEN"]
+GIST_ID   = os.environ["GIST_ID"]
+GIST_TOKEN= os.environ["GIST_TOKEN"]
 GIST_FILENAME = os.getenv("GIST_FILENAME", "keitaro_spend_state.json")
 
-def get_gist_state():
-    r = requests.get(f"https://api.github.com/gists/{GIST_ID}",
-                     headers={"Authorization": f"token {GIST_TOKEN}"}, timeout=20)
-    if r.status_code == 404:
-        return {}
-    r.raise_for_status()
-    files = r.json().get("files", {})
-    if GIST_FILENAME in files and files[GIST_FILENAME].get("content"):
-        try:
-            return json.loads(files[GIST_FILENAME]["content"])
-        except:
-            return {}
+SPEND_ABS = float(os.getenv("SPEND_ABS_THRESHOLD", "100"))
+SPEND_PCT = float(os.getenv("SPEND_PCT_THRESHOLD", "40"))
+SPEND_DIR = os.getenv("SPEND_DIRECTION", "up").lower()  # up|down|both
+
+def tg_send(text: str):
+    try:
+        requests.post(f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
+                      json={"chat_id": TG_CHAT, "text": text, "parse_mode": "HTML"}, timeout=20)
+    except Exception: pass
+
+def load_state() -> Dict[str, Any]:
+    try:
+        r = requests.get(f"https://api.github.com/gists/{GIST_ID}", timeout=30)
+        r.raise_for_status()
+        files = r.json().get("files", {})
+        if GIST_FILENAME in files:
+            return json.loads(files[GIST_FILENAME]["content"] or "{}")
+    except Exception:
+        pass
     return {}
 
-def save_gist_state(state: dict):
-    payload = {"files": {GIST_FILENAME: {"content": json.dumps(state, ensure_ascii=False, indent=2)}}}
-    r = requests.patch(f"https://api.github.com/gists/{GIST_ID}",
-                       headers={"Authorization": f"token {GIST_TOKEN}"},
-                       json=payload, timeout=20)
-    r.raise_for_status()
+def save_state(state: Dict[str, Any]):
+    headers={"Authorization": f"token {GIST_TOKEN}"}
+    payload={"files":{GIST_FILENAME: {"content": json.dumps(state, ensure_ascii=False)}}}
+    requests.patch(f"https://api.github.com/gists/{GIST_ID}", headers=headers, json=payload, timeout=30)
 
-def send_tg(msg: str):
-    requests.post(f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
-                  json={"chat_id": TG_CHAT, "text": msg, "parse_mode": "HTML",
-                        "disable_web_page_preview": True}, timeout=20).raise_for_status()
+def _normalize_money(s: str) -> float:
+    s = (s or "").strip()
+    s = s.replace("$","").replace(",","").replace("\u00A0","")
+    try: return float(s)
+    except: return 0.0
 
-def is_spike(prev: float | None, curr: float):
-    if prev is None: return (False, 0.0, 0.0)
-    if prev == 0 and curr == 0: return (False, 0.0, 0.0)
-    delta = curr - prev
-    pct = (delta / prev * 100.0) if prev != 0 else (999999.0 if curr>0 else -999999.0)
-    up = delta >= ABS_THR or pct >= PCT_THR
-    down = (-delta) >= ABS_THR or (-pct) >= PCT_THR
-    if DIRECTION == "up"   and delta > 0 and up:   return (True, delta, pct)
-    if DIRECTION == "down" and delta < 0 and down: return (True, delta, pct)
-    if DIRECTION == "both" and ((delta>0 and up) or (delta<0 and down)): return (True, delta, pct)
-    return (False, delta, pct)
-
-def format_alert(row, prev, delta, pct):
-    arrow = "🔺" if delta > 0 else "🔻"
-    return (
-        f"<b>{arrow} Spend spike detected</b>\n"
-        f"Campaign: <code>{row['campaign']}</code>\n"
-        f"SubID6: <code>{row.get('sub_id_6','')}</code>\n"
-        f"Cost: ${prev:.2f} → <b>${row['cost']:.2f}</b>  (Δ ${delta:.2f}, {pct:.1f}%)\n"
-        f"Clicks: {row.get('clicks',0)} | Leads: {row.get('leads',0)} | Sales: {row.get('sales',0)} | ROI: {row.get('roi','')}"
-    )
-
-def fetch_rows_via_xhr() -> list[dict]:
-    """
-    Логинимся в SPA и перехватываем JSON-ответ отчёта.
-    Возвращаем список строк: campaign, sub_id_6, cost, clicks, leads, sales, roi
-    """
-    rows_json = None
-
+def fetch_rows_via_dom() -> List[Dict[str, Any]]:
+    """Логин + парс DOM-таблицы отчёта (без XHR). Возвращает список словарей по строкам."""
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
         ctx = browser.new_context()
         page = ctx.new_page()
 
-        # логин
+        # --- 1) Логин ---
         page.goto(LOGIN_URL, wait_until="domcontentloaded")
-
-        # возможно, плейсхолдеры иконками — найдём по типам
-        # пробуем по плейсхолдерам на англ. (судя по appTranslation)
+        # поля (Keitaro login.vue)
+        filled = False
         try:
-            page.get_by_placeholder("Username").fill(LOGIN_USER)
-        except:
-            page.locator("input[type=text], input[name='login'], input[name='email']").first.fill(LOGIN_USER)
-        try:
-            page.get_by_placeholder("Password").fill(LOGIN_PASS)
-        except:
-            page.locator("input[type=password]").first.fill(LOGIN_PASS)
-
-        # кнопка Sign in
-        page.get_by_role("button", name=re.compile(r"Sign in", re.I)).click()
-
-        # ждём авторизацию
-        page.wait_for_load_state("networkidle")
-
-        # перехватим XHR с данными отчёта
-        def on_response(resp):
-            nonlocal rows_json
-            ct = resp.headers.get("content-type","")
-            url = resp.url
-            if "application/json" in ct and ("report" in url or "reports" in url or "stats" in url):
-                try:
-                    data = resp.json()
-                    # эвристика: Keitaro-подобный ответ с полями rows/data
-                    if isinstance(data, dict) and ("rows" in data or "data" in data):
-                        rows_json = data.get("rows") or data.get("data")
-                except Exception:
-                    pass
-
-        page.on("response", on_response)
-
-        # открываем страницу отчёта (hash-route)
-        page.goto(PAGE_URL, wait_until="networkidle")
-
-        # если JSON не поймали — подождём немного
-        page.wait_for_timeout(2000)
-
-        # fallback: принудительно клик по "Обновить"/refresh если есть
-        if rows_json is None:
+            page.get_by_placeholder(re.compile(r"Username|Login|Email", re.I)).fill(LOGIN_USER)
+            page.get_by_placeholder(re.compile(r"Password", re.I)).fill(LOGIN_PASS)
+            filled = True
+        except Exception:
+            # универсальные селекторы на всякий случай
             try:
-                page.get_by_role("button", name=re.compile(r"(Refresh|Update|Apply|Применить|Обновить)", re.I)).click()
-                page.wait_for_load_state("networkidle")
-                page.wait_for_timeout(1500)
-            except:
+                page.locator("input[type=text], input[name=login], input[name=email]").first.fill(LOGIN_USER)
+                page.locator("input[type=password]").first.fill(LOGIN_PASS)
+                filled = True
+            except Exception:
                 pass
 
-        html = page.content()
-        browser.close()
+        if filled:
+            # кнопка Sign in
+            try:
+                page.get_by_role("button", name=re.compile(r"sign in|войти|login", re.I)).click()
+            except Exception:
+                page.locator("button").first.click()
 
-    # если перехватили JSON — распарсим из него
-    if isinstance(rows_json, list) and rows_json:
-        rows = []
-        for r in rows_json:
-            # имена ключей предположительные — поправим после первого прогона
-            campaign = r.get("campaign") or r.get("campaign_name") or ""
-            sub6 = r.get("sub_id_6") or r.get("subid6") or ""
-            cost = float(r.get("cost", 0))
+        page.wait_for_load_state("networkidle")
+
+        # --- 2) Страница отчёта ---
+        page.goto(PAGE_URL, wait_until="domcontentloaded")
+
+        # ждём таблицу
+        page.wait_for_selector("table", timeout=15000)
+
+        # --- 3) Читаем заголовки и строим индекс колонок ---
+        headers = page.eval_on_selector_all("table thead th", "els => els.map(e => e.innerText.trim().toLowerCase())")
+        idx = {h:i for i,h in enumerate(headers)}
+
+        def gi(*keys, default=None):
+            for k in idx:
+                for key in keys:
+                    if key in k:
+                        return idx[k]
+            return default
+
+        i_campaign = gi("campaign")
+        i_sub6    = gi("sub id 6","sub_id 6","sub_id_6")
+        i_sub5    = gi("sub id 5","sub_id 5","sub_id_5")
+        i_sub4    = gi("sub id 4","sub_id 4","sub_id_4")
+        i_country = gi("country")
+        i_clicks  = gi("clicks")
+        i_leads   = gi("leads")
+        i_sales   = gi("sales")
+        i_cost    = gi("cost")
+        i_cpa     = gi("cpa")
+        i_roi     = gi("roi")
+
+        trs = page.query_selector_all("table tbody tr")
+        rows: List[Dict[str, Any]] = []
+        for tr in trs:
+            tds = tr.query_selector_all("td")
+            if not tds or i_campaign is None:
+                continue
+
+            def val(i):
+                try:
+                    if i is None or i >= len(tds): return ""
+                    return tds[i].inner_text().strip()
+                except: return ""
+
             rows.append({
-                "campaign": campaign,
-                "sub_id_6": sub6,
-                "cost": cost,
-                "clicks": r.get("clicks", 0),
-                "leads": r.get("leads", 0),
-                "sales": r.get("sales", 0),
-                "roi": r.get("roi_confirmed") or r.get("roi") or ""
+                "campaign": val(i_campaign),
+                "sub_id_6": val(i_sub6),
+                "sub_id_5": val(i_sub5),
+                "sub_id_4": val(i_sub4),
+                "country":  val(i_country),
+                "clicks":   int(val(i_clicks) or 0),
+                "leads":    int(val(i_leads)  or 0),
+                "sales":    int(val(i_sales)  or 0),
+                "cpa":      _normalize_money(val(i_cpa)),
+                "roi":      val(i_roi),
+                "cost":     _normalize_money(val(i_cost)),
             })
+
+        browser.close()
         return rows
 
-    # fallback №2: если JSON не словили, можно дернуть DOM таблицы (если она реально рендерится)
-    # но чаще в SPA таблица виртуальная — поэтому основной путь через XHR.
-    return []
+def key_of(row: Dict[str, Any]) -> str:
+    # группируем по (campaign, sub_id_6) — при желании расширь
+    return f"{row.get('campaign','')}|{row.get('sub_id_6','')}"
+
+def detect_changes(prev: Dict[str, Any], curr_rows: List[Dict[str, Any]]) -> Tuple[List[str], Dict[str, Any]]:
+    """Формируем сообщения: про spend, leads, sales. Возвращаем (messages, new_state)."""
+    new_state = prev.copy()
+    msgs: List[str] = []
+
+    for r in curr_rows:
+        k = key_of(r)
+        now_cost  = float(r.get("cost", 0) or 0)
+        now_leads = int(r.get("leads",0) or 0)
+        now_sales = int(r.get("sales",0) or 0)
+
+        old = prev.get(k, {"cost":0, "leads":0, "sales":0})
+        old_cost, old_leads, old_sales = float(old.get("cost",0)), int(old.get("leads",0)), int(old.get("sales",0))
+
+        # 1) Spend jump
+        delta_cost = now_cost - old_cost
+        pct = (abs(delta_cost) / old_cost * 100) if old_cost > 0 else (100 if now_cost>0 else 0)
+        direction_ok = (SPEND_DIR=="both") or (SPEND_DIR=="up" and delta_cost>0) or (SPEND_DIR=="down" and delta_cost<0)
+        if direction_ok and (abs(delta_cost) >= SPEND_AB or pct >= SPEND_PCT):
+            arrow = "⬆️" if delta_cost>0 else "⬇️"
+            msgs.append(
+                f"<b>SPEND {arrow}</b>\n"
+                f"<b>Campaign:</b> {r['campaign']}\n"
+                f"<b>SubID6:</b> {r.get('sub_id_6','')}\n"
+                f"<b>Cost:</b> ${old_cost:.2f} → ${now_cost:.2f} ({'+' if delta_cost>=0 else ''}{delta_cost:.2f}, ~{pct:.0f}%)"
+            )
+
+        # 2) Leads change
+        if now_leads != old_leads:
+            arrow = "🟢" if now_leads>old_leads else "🟠"
+            msgs.append(
+                f"<b>LEADS {arrow}</b>\n"
+                f"<b>Campaign:</b> {r['campaign']} | <b>SubID6:</b> {r.get('sub_id_6','')}\n"
+                f"{old_leads} → {now_leads}"
+            )
+
+        # 3) Sales change
+        if now_sales != old_sales:
+            arrow = "💰" if now_sales>old_sales else "🟨"
+            msgs.append(
+                f"<b>SALES {arrow}</b>\n"
+                f"<b>Campaign:</b> {r['campaign']} | <b>SubID6:</b> {r.get('sub_id_6','')}\n"
+                f"{old_sales} → {now_sales}"
+            )
+
+        new_state[k] = {"cost": now_cost, "leads": now_leads, "sales": now_sales}
+
+    return msgs, new_state
 
 def main():
-    state = get_gist_state()  # key -> last_cost (float)
-    rows = fetch_rows_via_xhr()
-
+    rows = fetch_rows_via_dom()
     if not rows:
-        # Сообщим об ошибке однажды
-        try:
-            send_tg("⚠️ Не удалось получить данные отчёта (ни один JSON не перехвачен). Проверьте селекторы/роль кнопки логина/URL.")
-        except: pass
+        tg_send("⚠️ Не удалось прочитать таблицу (DOM пуст). Проверьте URL отчёта и доступы.")
         return
 
-    changed = False
-    for row in rows:
-        key = f"{row['campaign']}|{row.get('sub_id_6','')}"
-        prev = state.get(key)
-        spike, delta, pct = is_spike(prev, row["cost"])
-        if spike:
-            send_tg(format_alert(row, prev if prev is not None else 0.0, delta, pct))
-        state[key] = row["cost"]
-        changed = True
+    prev = load_state()
+    msgs, new_state = detect_changes(prev, rows)
 
-    if changed:
-        save_gist_state(state)
+    if msgs:
+        for m in msgs:
+            tg_send(m)
+    else:
+        # опционально — тихий проход без уведомлений
+        pass
+
+    save_state(new_state)
 
 if __name__ == "__main__":
     main()
