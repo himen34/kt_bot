@@ -2,51 +2,33 @@ name: tg-notifier
 
 on:
   schedule:
-    # основной интервал
     - cron: "*/5 * * * *"
-    # резервный сдвиг на 2 минуты (если GitHub пропустит одно окно)
-    - cron: "2-57/5 * * * *"
-  workflow_dispatch: {}   # можно оставить для тестов
-
-# Разводим очереди для schedule и вручную, чтобы не отменяли друг друга
-concurrency:
-  group: tg-notifier-${{ github.event_name }}
-  cancel-in-progress: true
+  workflow_dispatch:
 
 jobs:
   run:
     runs-on: ubuntu-22.04
-    env:
-      LOGIN_USER: ${{ secrets.LOGIN_USER }}
-      LOGIN_PASS: ${{ secrets.LOGIN_PASS }}
-      PAGE_URL:  ${{ secrets.PAGE_URL }}
-      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-      TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-      GIST_ID: ${{ secrets.GIST_ID }}
-      GIST_TOKEN: ${{ secrets.GIST_TOKEN }}
-      GIST_FILENAME: keitaro_spend_state.json
-      SPEND_ABS_THRESHOLD: ${{ secrets.SPEND_ABS_THRESHOLD }}
-      SPEND_PCT_THRESHOLD: ${{ secrets.SPEND_PCT_THRESHOLD }}
-      SPEND_DIRECTION: ${{ secrets.SPEND_DIRECTION }}
-
     steps:
       - uses: actions/checkout@v4
-
-      - name: Debug header (видно в логе что сработало)
-        run: |
-          echo "EVENT=${{ github.event_name }}"
-          echo "BRANCH=${{ github.ref }}"
-          echo "NOW_UTC=$(date -u '+%Y-%m-%d %H:%M:%S UTC')"
-
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-
-      - name: Install Python deps + browsers
+      - name: Install Python deps + Playwright
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
           python -m playwright install --with-deps chromium
-
       - name: Run notifier
+        env:
+          LOGIN_USER: ${{ secrets.LOGIN_USER }}
+          LOGIN_PASS: ${{ secrets.LOGIN_PASS }}
+          PAGE_URL: ${{ secrets.PAGE_URL }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          GIST_ID: ${{ secrets.GIST_ID }}
+          GIST_TOKEN: ${{ secrets.GIST_TOKEN }}
+          GIST_FILENAME: keitaro_spend_state.json
+          SPEND_ABS_THRESHOLD: ${{ secrets.SPEND_ABS_THRESHOLD }}
+          SPEND_PCT_THRESHOLD: ${{ secrets.SPEND_PCT_THRESHOLD }}
+          SPEND_DIRECTION: ${{ secrets.SPEND_DIRECTION }}
         run: python notifier_playwright.py
