@@ -1,12 +1,17 @@
 name: tg-notifier
+
 on:
   schedule:
-    - cron: "*/5 * * * *"
-  workflow_dispatch:
+    - cron: "*/5 * * * *"   # ⏰ каждые 5 минут (UTC)
+
+concurrency:
+  group: tg-notifier
+  cancel-in-progress: true   # отменяет предыдущий запуск, если новый начался
 
 jobs:
   run:
     runs-on: ubuntu-22.04
+
     env:
       LOGIN_USER: ${{ secrets.LOGIN_USER }}
       LOGIN_PASS: ${{ secrets.LOGIN_PASS }}
@@ -22,26 +27,16 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
-      - name: Install Python deps
+      - name: Install Python deps + browsers
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
           python -m playwright install --with-deps chromium
-
-      - name: Check required env
-        run: |
-          python - <<'PY'
-          import os, sys
-          required = ["LOGIN_USER","LOGIN_PASS","PAGE_URL","TELEGRAM_BOT_TOKEN","TELEGRAM_CHAT_ID","GIST_ID","GIST_TOKEN"]
-          missing = [k for k in required if not os.getenv(k)]
-          if missing:
-              print("❌ Missing secrets:", ", ".join(missing)); sys.exit(1)
-          print("✅ All secrets are set.")
-          PY
 
       - name: Run notifier
         run: python notifier_playwright.py
