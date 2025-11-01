@@ -2,16 +2,20 @@ name: tg-notifier
 
 on:
   schedule:
-    - cron: "*/5 * * * *"   # ⏰ каждые 5 минут (UTC)
+    # основной интервал
+    - cron: "*/5 * * * *"
+    # резервный сдвиг на 2 минуты (если GitHub пропустит одно окно)
+    - cron: "2-57/5 * * * *"
+  workflow_dispatch: {}   # можно оставить для тестов
 
+# Разводим очереди для schedule и вручную, чтобы не отменяли друг друга
 concurrency:
-  group: tg-notifier
-  cancel-in-progress: true   # отменяет предыдущий запуск, если новый начался
+  group: tg-notifier-${{ github.event_name }}
+  cancel-in-progress: true
 
 jobs:
   run:
     runs-on: ubuntu-22.04
-
     env:
       LOGIN_USER: ${{ secrets.LOGIN_USER }}
       LOGIN_PASS: ${{ secrets.LOGIN_PASS }}
@@ -27,6 +31,12 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+
+      - name: Debug header (видно в логе что сработало)
+        run: |
+          echo "EVENT=${{ github.event_name }}"
+          echo "BRANCH=${{ github.ref }}"
+          echo "NOW_UTC=$(date -u '+%Y-%m-%d %H:%M:%S UTC')"
 
       - uses: actions/setup-python@v5
         with:
