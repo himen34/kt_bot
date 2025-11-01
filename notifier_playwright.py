@@ -1,26 +1,5 @@
 # -*- coding: utf-8 -*-
-"""
-Login → open PAGE_URL → parse table DOM → compare with previous state (Gist) →
-send Telegram messages grouped per Campaign.
-
-Message format (only sections with changes are shown):
-alert
-Campaign: <campaign>
-SubID5: <sub5>  SubID4: <sub4>
-Cost: $<old> → $<new>  (Δ <+/-x.xx>, ~<pct>%) 🔺/🔻
-
-реги:
-SubID5: <sub5>  SubID4: <sub4>  reg: <old> → <new>
-
-депы:
-SubID5: <sub5>  SubID4: <sub4>  dep: <old> → <new>
-
-If no changes at all → "accs on vacation..."
-"""
-
-import os
-import re
-import json
+import os, re, json
 from collections import defaultdict
 from typing import Dict, Any, List, Tuple
 import requests
@@ -39,22 +18,20 @@ GIST_ID       = os.environ["GIST_ID"]
 GIST_TOKEN    = os.environ["GIST_TOKEN"]
 GIST_FILENAME = os.getenv("GIST_FILENAME", "keitaro_spend_state.json")
 
-SPEND_ABS = float(os.getenv("SPEND_ABS_THRESHOLD", "20"))   # $ threshold (default 20)
-SPEND_PCT = float(os.getenv("SPEND_PCT_THRESHOLD", "20"))   # % threshold (default 20)
-SPEND_DIR = os.getenv("SPEND_DIRECTION", "up").lower()       # up|down|both
+SPEND_ABS = float(os.getenv("SPEND_ABS_THRESHOLD", "20"))   # $ threshold
+SPEND_PCT = float(os.getenv("SPEND_PCT_THRESHOLD", "20"))   # % threshold
+SPEND_DIR = os.getenv("SPEND_DIRECTION", "up").lower()      # up|down|both
 
-
-# ---------- utils ----------
+# ---------- helpers ----------
 def tg_send(text: str) -> None:
     try:
         requests.post(
             f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
             json={"chat_id": TG_CHAT, "text": text, "parse_mode": "HTML", "disable_web_page_preview": True},
-            timeout=25
+            timeout=25,
         ).raise_for_status()
     except Exception:
         pass
-
 
 def load_state() -> Dict[str, Any]:
     try:
@@ -63,15 +40,13 @@ def load_state() -> Dict[str, Any]:
             headers={"Authorization": f"token {GIST_TOKEN}"},
             timeout=30,
         )
-        if r.status_code == 404:
-            return {}
+        if r.status_code == 404: return {}
         r.raise_for_status()
         files = r.json().get("files", {})
         content = files.get(GIST_FILENAME, {}).get("content", "")
         return json.loads(content) if content else {}
     except Exception:
         return {}
-
 
 def save_state(state: Dict[str, Any]) -> None:
     payload = {"files": {GIST_FILENAME: {"content": json.dumps(state, ensure_ascii=False, indent=2)}}}
@@ -82,29 +57,19 @@ def save_state(state: Dict[str, Any]) -> None:
         timeout=30,
     ).raise_for_status()
 
-
 def _to_int(x: Any) -> int:
-    try:
-        return int(str(x).strip())
-    except Exception:
-        return 0
-
+    try: return int(str(x).strip())
+    except: return 0
 
 def _to_money(s: Any) -> float:
     try:
-        s = str(s).replace("$", "").replace(",", "").replace("\u00A0", "").strip()
+        s = str(s).replace("$","").replace(",","").replace("\u00A0","").strip()
         return float(s or 0)
-    except Exception:
+    except:
         return 0.0
-
 
 # ---------- scraping ----------
 def fetch_rows_via_dom() -> List[Dict[str, Any]]:
-    """
-    Login + open PAGE_URL + parse table DOM.
-    Columns we try to map (case-insensitive, substring match):
-      campaign, sub id 6/5/4, country, clicks, leads, sales, cpa, roi, cost
-    """
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
         ctx = browser.new_context()
@@ -131,13 +96,11 @@ def fetch_rows_via_dom() -> List[Dict[str, Any]]:
                 page.locator("button").first.click()
         page.wait_for_load_state("networkidle")
 
-        # report page
+        # report
         page.goto(PAGE_URL, wait_until="domcontentloaded")
         page.wait_for_selector("table", timeout=20000)
 
-        headers = page.eval_on_selector_all(
-            "table thead th", "els => els.map(e => e.innerText.trim().toLowerCase())"
-        )
+        headers = page.eval_on_selector_all("table thead th", "els => els.map(e => e.innerText.trim().toLowerCase())")
         idx = {h: i for i, h in enumerate(headers)}
 
         def gi(*keys, default=None):
@@ -148,9 +111,9 @@ def fetch_rows_via_dom() -> List[Dict[str, Any]]:
             return default
 
         i_campaign = gi("campaign")
-        i_sub6    = gi("sub id 6", "sub_id 6", "sub_id_6")
-        i_sub5    = gi("sub id 5", "sub_id 5", "sub_id_5")
-        i_sub4    = gi("sub id 4", "sub_id 4", "sub_id_4")
+        i_sub6    = gi("sub id 6","sub_id 6","sub_id_6")
+        i_sub5    = gi("sub id 5","sub_id 5","sub_id_5")
+        i_sub4    = gi("sub id 4","sub_id 4","sub_id_4")
         i_clicks  = gi("clicks")
         i_leads   = gi("leads")
         i_sales   = gi("sales")
@@ -162,15 +125,12 @@ def fetch_rows_via_dom() -> List[Dict[str, Any]]:
         rows: List[Dict[str, Any]] = []
         for tr in page.query_selector_all("table tbody tr"):
             tds = tr.query_selector_all("td")
-            if not tds:
-                continue
+            if not tds: continue
 
             def val(i):
                 if i is None or i >= len(tds): return ""
-                try:
-                    return tds[i].inner_text().strip()
-                except Exception:
-                    return ""
+                try: return tds[i].inner_text().strip()
+                except: return ""
 
             rows.append({
                 "campaign": val(i_campaign),
@@ -186,25 +146,12 @@ def fetch_rows_via_dom() -> List[Dict[str, Any]]:
         browser.close()
         return rows
 
-
-# ---------- diff + message build ----------
+# ---------- diff & pretty messages ----------
 def key_for_state(r: Dict[str, Any]) -> str:
-    # Храним по Campaign|SubID5|SubID4 (стабильно для твоей задачи)
+    # стабильный ключ — по кампании + SubID5 + SubID4
     return f"{r.get('campaign','')}|{r.get('sub_id_5','')}|{r.get('sub_id_4','')}"
 
 def detect_changes(prev: Dict[str, Any], curr: List[Dict[str, Any]]) -> Tuple[Dict[str, Dict[str, List[str]]], Dict[str, Any]]:
-    """
-    Возвращает:
-      changes_by_campaign = {
-        campaign: {
-          "spend": [lines...],
-          "regs":  [lines...],
-          "deps":  [lines...],
-        },
-        ...
-      },
-      new_state
-    """
     new_state = prev.copy()
     out: Dict[str, Dict[str, List[str]]] = defaultdict(lambda: {"spend": [], "regs": [], "deps": []})
 
@@ -220,7 +167,6 @@ def detect_changes(prev: Dict[str, Any], curr: List[Dict[str, Any]]) -> Tuple[Di
 
         old = prev.get(k)
         if old is None:
-            # первый раз видим этот ключ — просто зафиксируем базу
             new_state[k] = {"cost": now_cost, "leads": now_leads, "sales": now_sales}
             continue
 
@@ -243,89 +189,70 @@ def detect_changes(prev: Dict[str, Any], curr: List[Dict[str, Any]]) -> Tuple[Di
         # regs
         if now_leads != old_leads:
             out[camp]["regs"].append(
-                f"SubID5: <code>{sub5}</code>  SubID4: <code>{sub4}</code>  reg: {old_leads} → <b>{now_leads}</b>"
+                f"SubID5: <code>{sub5}</code>  SubID4: <code>{sub4}</code>  REG: {old_leads} → <b>{now_leads}</b>"
             )
 
         # deps
         if now_sales != old_sales:
             out[camp]["deps"].append(
-                f"SubID5: <code>{sub5}</code>  SubID4: <code>{sub4}</code>  dep: {old_sales} → <b>{now_sales}</b>"
+                f"SubID5: <code>{sub5}</code>  SubID4: <code>{sub4}</code>  DEP: {old_sales} → <b>{now_sales}</b>"
             )
 
-        # update state
         new_state[k] = {"cost": now_cost, "leads": now_leads, "sales": now_sales}
 
     return out, new_state
 
-
 def send_grouped_messages(changes: Dict[str, Dict[str, List[str]]]) -> int:
-    """
-    Шлём по одному сообщению на кампанию.
-    Возвращает количество отправленных сообщений.
-    """
     sent = 0
     for camp, parts in changes.items():
-        lines: List[str] = []
+        blocks: List[str] = []
 
         if parts["spend"]:
-            lines.append("alert")
-            lines.append(f"Campaign: {camp}")
-            lines.append("\n".join(parts["spend"]))
+            blocks.append("🧊 <b>SPEND ALERT</b>")
+            blocks.append(f"<b>CAMPAIGN:</b> {camp}")
+            blocks.append("\n".join(parts["spend"]))
 
         if parts["regs"]:
-            if lines: lines.append("")  # пустая строка-разделитель
-            lines.append("реги:")
-            lines.append("\n".join(parts["regs"]))
+            if blocks: blocks.append("")
+            blocks.append("🟩 <b>REGS</b>")
+            blocks.append("\n".join(parts["regs"]))
 
         if parts["deps"]:
-            if lines: lines.append("")
-            lines.append("депы:")
-            lines.append("\n".join(parts["deps"]))
+            if blocks: blocks.append("")
+            blocks.append("🟧 <b>DEPS</b>")
+            blocks.append("\n".join(parts["deps"]))
 
-        if not lines:
+        if not blocks:
             continue
 
-        msg = "\n".join(lines)
-        tg_send(msg)
+        tg_send("\n".join(blocks))
         sent += 1
 
     return sent
 
-
 # ---------- main ----------
 def main() -> None:
-    # 1) читаем текущее
     rows = fetch_rows_via_dom()
-
-    # 2) прошлое состояние
     prev = load_state()
 
-    # Если стейт пуст — инициализация без алертов, чтобы не спамить «0→X»
+    # тихая инициализация базы
     if not prev:
         base = {}
         for r in rows:
-            k = key_for_state(r)
-            base[k] = {
+            base[key_for_state(r)] = {
                 "cost": float(r.get("cost") or 0.0),
                 "leads": int(r.get("leads") or 0),
                 "sales": int(r.get("sales") or 0),
             }
         save_state(base)
-        # Можно раскомментировать «heartbeat»:
-        # tg_send("✅ База инициализирована. Алерты пойдут со следующего запуска.")
         return
 
-    # 3) диф
     changes, new_state = detect_changes(prev, rows)
+    total = send_grouped_messages(changes)
+    if total == 0:
+        tg_send("🛌 <b>ACCS ON VACATION…</b>")
 
-    # 4) отправка
-    total_sent = send_grouped_messages(changes)
-    if total_sent == 0:
-        tg_send("accs on vacation...")
-
-    # 5) сохранить стейт
     save_state(new_state)
-
 
 if __name__ == "__main__":
     main()
