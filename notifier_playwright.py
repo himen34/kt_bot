@@ -1,28 +1,32 @@
 # -*- coding: utf-8 -*-
 """
-Логин в https://trident.partners/admin/, открытие favourite-репорта (PAGE_URL),
-парсинг DOM-таблицы и сравнение с прошлым состоянием (Gist).
-Шлёт отдельные уведомления в Telegram:
- - 🟦 резкий скачок spend (cost) по порогам ABS/PCT и направлению DIRECTION
- - 🟩 новая "регa" (рост leads)
- - 🟧 новый "деп" (рост sales)
+Login → open PAGE_URL → parse table DOM → compare with previous state (Gist) →
+send Telegram messages grouped per Campaign.
 
-ENV (GitHub Secrets):
-  LOGIN_USER, LOGIN_PASS
-  PAGE_URL
-  TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
-  GIST_ID, GIST_TOKEN, [GIST_FILENAME=keitaro_spend_state.json]
-  [SPEND_ABS_THRESHOLD=100], [SPEND_PCT_THRESHOLD=40], [SPEND_DIRECTION=up|down|both]
+Message format (only sections with changes are shown):
+alert
+Campaign: <campaign>
+SubID5: <sub5>  SubID4: <sub4>
+Cost: $<old> → $<new>  (Δ <+/-x.xx>, ~<pct>%) 🔺/🔻
+
+реги:
+SubID5: <sub5>  SubID4: <sub4>  reg: <old> → <new>
+
+депы:
+SubID5: <sub5>  SubID4: <sub4>  dep: <old> → <new>
+
+If no changes at all → "accs on vacation..."
 """
 
 import os
 import re
 import json
-from typing import List, Dict, Any, Tuple
+from collections import defaultdict
+from typing import Dict, Any, List, Tuple
 import requests
 from playwright.sync_api import sync_playwright
 
-# ----------- Конфиг из переменных окружения -----------
+# ---------- ENV ----------
 LOGIN_URL  = "https://trident.partners/admin/"
 LOGIN_USER = os.environ["LOGIN_USER"]
 LOGIN_PASS = os.environ["LOGIN_PASS"]
@@ -35,14 +39,13 @@ GIST_ID       = os.environ["GIST_ID"]
 GIST_TOKEN    = os.environ["GIST_TOKEN"]
 GIST_FILENAME = os.getenv("GIST_FILENAME", "keitaro_spend_state.json")
 
-SPEND_ABS = float(os.getenv("SPEND_ABS_THRESHOLD", "100"))   # $-порог
-SPEND_PCT = float(os.getenv("SPEND_PCT_THRESHOLD", "40"))    # %-порог
-SPEND_DIR = os.getenv("SPEND_DIRECTION", "up").lower()        # up|down|both
+SPEND_ABS = float(os.getenv("SPEND_ABS_THRESHOLD", "20"))   # $ threshold (default 20)
+SPEND_PCT = float(os.getenv("SPEND_PCT_THRESHOLD", "20"))   # % threshold (default 20)
+SPEND_DIR = os.getenv("SPEND_DIRECTION", "up").lower()       # up|down|both
 
 
-# ------------------- Утилиты -------------------
+# ---------- utils ----------
 def tg_send(text: str) -> None:
-    """Отправка сообщения в Telegram."""
     try:
         requests.post(
             f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
@@ -54,61 +57,61 @@ def tg_send(text: str) -> None:
 
 
 def load_state() -> Dict[str, Any]:
-    """Читаем прошлое состояние из Gist (key -> {cost, leads, sales})."""
     try:
-        r = requests.get(f"https://api.github.com/gists/{GIST_ID}", timeout=30,
-                         headers={"Authorization": f"token {GIST_TOKEN}"})
+        r = requests.get(
+            f"https://api.github.com/gists/{GIST_ID}",
+            headers={"Authorization": f"token {GIST_TOKEN}"},
+            timeout=30,
+        )
         if r.status_code == 404:
             return {}
         r.raise_for_status()
         files = r.json().get("files", {})
-        if GIST_FILENAME in files and files[GIST_FILENAME].get("content"):
-            return json.loads(files[GIST_FILENAME]["content"])
+        content = files.get(GIST_FILENAME, {}).get("content", "")
+        return json.loads(content) if content else {}
     except Exception:
-        pass
-    return {}
+        return {}
 
 
 def save_state(state: Dict[str, Any]) -> None:
-    """Сохраняем состояние в Gist."""
     payload = {"files": {GIST_FILENAME: {"content": json.dumps(state, ensure_ascii=False, indent=2)}}}
     requests.patch(
         f"https://api.github.com/gists/{GIST_ID}",
         headers={"Authorization": f"token {GIST_TOKEN}"},
         json=payload,
-        timeout=30
+        timeout=30,
     ).raise_for_status()
 
 
-def _to_int(s: Any) -> int:
+def _to_int(x: Any) -> int:
     try:
-        return int(str(s).strip())
+        return int(str(x).strip())
     except Exception:
         return 0
 
 
-def _to_money(s: str) -> float:
+def _to_money(s: Any) -> float:
     try:
-        return float(str(s).replace("$", "").replace(",", "").replace("\u00A0", "").strip() or 0)
+        s = str(s).replace("$", "").replace(",", "").replace("\u00A0", "").strip()
+        return float(s or 0)
     except Exception:
         return 0.0
 
 
-# ------------------- Парсинг DOM-таблицы -------------------
+# ---------- scraping ----------
 def fetch_rows_via_dom() -> List[Dict[str, Any]]:
     """
-    Логин + открытие страницы отчёта + парс таблицы (thead/tbody).
-    Возвращает список словарей: campaign, sub_id_6, clicks, leads, sales, cost (+доп. поля).
+    Login + open PAGE_URL + parse table DOM.
+    Columns we try to map (case-insensitive, substring match):
+      campaign, sub id 6/5/4, country, clicks, leads, sales, cpa, roi, cost
     """
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
         ctx = browser.new_context()
         page = ctx.new_page()
 
-        # --- 1) логин ---
+        # login
         page.goto(LOGIN_URL, wait_until="domcontentloaded")
-
-        # ввод логина/пароля (несколько стратегий селекторов)
         filled = False
         try:
             page.get_by_placeholder(re.compile(r"Username|Login|Email", re.I)).fill(LOGIN_USER)
@@ -121,20 +124,17 @@ def fetch_rows_via_dom() -> List[Dict[str, Any]]:
                 filled = True
             except Exception:
                 pass
-
         if filled:
             try:
                 page.get_by_role("button", name=re.compile(r"(sign in|войти|login)", re.I)).click()
             except Exception:
                 page.locator("button").first.click()
-
         page.wait_for_load_state("networkidle")
 
-        # --- 2) страница отчёта ---
+        # report page
         page.goto(PAGE_URL, wait_until="domcontentloaded")
-        page.wait_for_selector("table", timeout=15000)
+        page.wait_for_selector("table", timeout=20000)
 
-        # --- 3) хэдеры и индексы колонок ---
         headers = page.eval_on_selector_all(
             "table thead th", "els => els.map(e => e.innerText.trim().toLowerCase())"
         )
@@ -151,29 +151,22 @@ def fetch_rows_via_dom() -> List[Dict[str, Any]]:
         i_sub6    = gi("sub id 6", "sub_id 6", "sub_id_6")
         i_sub5    = gi("sub id 5", "sub_id 5", "sub_id_5")
         i_sub4    = gi("sub id 4", "sub_id 4", "sub_id_4")
-        i_country = gi("country")
         i_clicks  = gi("clicks")
         i_leads   = gi("leads")
         i_sales   = gi("sales")
         i_cost    = gi("cost")
-        i_cpa     = gi("cpa")
-        i_roi     = gi("roi")
 
         if i_campaign is None or i_cost is None:
             raise RuntimeError("Не найдены обязательные колонки (campaign/cost). Проверь заголовки таблицы.")
 
-        # --- 4) строки ---
-        trs = page.query_selector_all("table tbody tr")
         rows: List[Dict[str, Any]] = []
-
-        for tr in trs:
+        for tr in page.query_selector_all("table tbody tr"):
             tds = tr.query_selector_all("td")
             if not tds:
                 continue
 
             def val(i):
-                if i is None or i >= len(tds):
-                    return ""
+                if i is None or i >= len(tds): return ""
                 try:
                     return tds[i].inner_text().strip()
                 except Exception:
@@ -184,111 +177,154 @@ def fetch_rows_via_dom() -> List[Dict[str, Any]]:
                 "sub_id_6": val(i_sub6),
                 "sub_id_5": val(i_sub5),
                 "sub_id_4": val(i_sub4),
-                "country":  val(i_country),
                 "clicks":   _to_int(val(i_clicks)),
                 "leads":    _to_int(val(i_leads)),
                 "sales":    _to_int(val(i_sales)),
-                "cpa":      _to_money(val(i_cpa)),
-                "roi":      val(i_roi),
-                "cost":     _to_money(val(i_cost)),
+                "cost":     round(_to_money(val(i_cost)), 2),
             })
 
         browser.close()
         return rows
 
 
-# ------------------- Сравнение и формирование алертов -------------------
-def key_of(row: Dict[str, Any]) -> str:
-    # Ключ агрегации: кампания + SubID6 (можно расширить)
-    return f"{row.get('campaign','')}|{row.get('sub_id_6','')}"
+# ---------- diff + message build ----------
+def key_for_state(r: Dict[str, Any]) -> str:
+    # Храним по Campaign|SubID5|SubID4 (стабильно для твоей задачи)
+    return f"{r.get('campaign','')}|{r.get('sub_id_5','')}|{r.get('sub_id_4','')}"
 
-def detect_changes(prev: Dict[str, Any], curr_rows: List[Dict[str, Any]]) -> Tuple[List[str], Dict[str, Any]]:
-    """Возвращает (список сообщений, новое_состояние)."""
+def detect_changes(prev: Dict[str, Any], curr: List[Dict[str, Any]]) -> Tuple[Dict[str, Dict[str, List[str]]], Dict[str, Any]]:
+    """
+    Возвращает:
+      changes_by_campaign = {
+        campaign: {
+          "spend": [lines...],
+          "regs":  [lines...],
+          "deps":  [lines...],
+        },
+        ...
+      },
+      new_state
+    """
     new_state = prev.copy()
-    messages: List[str] = []
+    out: Dict[str, Dict[str, List[str]]] = defaultdict(lambda: {"spend": [], "regs": [], "deps": []})
 
-    for r in curr_rows:
-        k = key_of(r)
+    for r in curr:
+        camp = (r.get("campaign") or "").strip()
+        sub5 = (r.get("sub_id_5") or "").strip()
+        sub4 = (r.get("sub_id_4") or "").strip()
+        k = key_for_state(r)
+
         now_cost  = float(r.get("cost") or 0.0)
         now_leads = int(r.get("leads") or 0)
         now_sales = int(r.get("sales") or 0)
 
-        old = prev.get(k, {"cost": 0.0, "leads": 0, "sales": 0})
+        old = prev.get(k)
+        if old is None:
+            # первый раз видим этот ключ — просто зафиксируем базу
+            new_state[k] = {"cost": now_cost, "leads": now_leads, "sales": now_sales}
+            continue
+
         old_cost  = float(old.get("cost", 0.0))
         old_leads = int(old.get("leads", 0))
         old_sales = int(old.get("sales", 0))
 
-        # --- 1) Spend jump ---
-        delta_cost = now_cost - old_cost
-        pct = (abs(delta_cost) / old_cost * 100.0) if old_cost > 0 else (100.0 if now_cost > 0 else 0.0)
+        # spend
+        delta = round(now_cost - old_cost, 2)
+        pct = round((abs(delta) / old_cost * 100.0), 0) if old_cost > 0 else (100.0 if now_cost > 0 else 0.0)
+        direction_ok = (SPEND_DIR == "both") or (SPEND_DIR == "up" and delta > 0) or (SPEND_DIR == "down" and delta < 0)
 
-        direction_ok = (
-            SPEND_DIR == "both" or
-            (SPEND_DIR == "up" and delta_cost > 0) or
-            (SPEND_DIR == "down" and delta_cost < 0)
-        )
-        if direction_ok and (abs(delta_cost) >= SPEND_ABS or pct >= SPEND_PCT):
-            arrow = "🔺" if delta_cost > 0 else "🔻"
-            messages.append(
-                "🟦 <b>Spend change</b>\n"
-                f"Campaign: <code>{r.get('campaign','')}</code>\n"
-                f"SubID6: <code>{r.get('sub_id_6','')}</code>\n"
-                f"Cost: ${old_cost:.2f} → <b>${now_cost:.2f}</b>  "
-                f"(Δ {('+' if delta_cost>=0 else '')}{delta_cost:.2f}, ~{pct:.0f}%){' ' + arrow}"
+        if direction_ok and (abs(delta) >= SPEND_ABS or pct >= SPEND_PCT):
+            arrow = "🔺" if delta > 0 else "🔻"
+            out[camp]["spend"].append(
+                f"SubID5: <code>{sub5}</code>  SubID4: <code>{sub4}</code>\n"
+                f"Cost: ${old_cost:.2f} → <b>${now_cost:.2f}</b>  (Δ {('+' if delta>=0 else '')}{delta:.2f}, ~{int(pct)}%) {arrow}"
             )
 
-        # --- 2) Leads (регa) ---
+        # regs
         if now_leads != old_leads:
-            if now_leads > old_leads:
-                diff = now_leads - old_leads
-                messages.append(
-                    "🟩 <b>New reg</b> (leads)\n"
-                    f"Campaign: <code>{r.get('campaign','')}</code>\n"
-                    f"SubID6: <code>{r.get('sub_id_6','')}</code>\n"
-                    f"{old_leads} → <b>{now_leads}</b>  (Δ +{diff})"
-                )
+            out[camp]["regs"].append(
+                f"SubID5: <code>{sub5}</code>  SubID4: <code>{sub4}</code>  reg: {old_leads} → <b>{now_leads}</b>"
+            )
 
-        # --- 3) Sales (деп) ---
+        # deps
         if now_sales != old_sales:
-            if now_sales > old_sales:
-                diff = now_sales - old_sales
-                messages.append(
-                    "🟧 <b>New dep</b> (sales)\n"
-                    f"Campaign: <code>{r.get('campaign','')}</code>\n"
-                    f"SubID6: <code>{r.get('sub_id_6','')}</code>\n"
-                    f"{old_sales} → <b>{now_sales}</b>  (Δ +{diff})"
-                )
+            out[camp]["deps"].append(
+                f"SubID5: <code>{sub5}</code>  SubID4: <code>{sub4}</code>  dep: {old_sales} → <b>{now_sales}</b>"
+            )
 
-        # обновляем состояние по ключу
+        # update state
         new_state[k] = {"cost": now_cost, "leads": now_leads, "sales": now_sales}
 
-    return messages, new_state
+    return out, new_state
 
 
-# ------------------- Точка входа -------------------
+def send_grouped_messages(changes: Dict[str, Dict[str, List[str]]]) -> int:
+    """
+    Шлём по одному сообщению на кампанию.
+    Возвращает количество отправленных сообщений.
+    """
+    sent = 0
+    for camp, parts in changes.items():
+        lines: List[str] = []
+
+        if parts["spend"]:
+            lines.append("alert")
+            lines.append(f"Campaign: {camp}")
+            lines.append("\n".join(parts["spend"]))
+
+        if parts["regs"]:
+            if lines: lines.append("")  # пустая строка-разделитель
+            lines.append("реги:")
+            lines.append("\n".join(parts["regs"]))
+
+        if parts["deps"]:
+            if lines: lines.append("")
+            lines.append("депы:")
+            lines.append("\n".join(parts["deps"]))
+
+        if not lines:
+            continue
+
+        msg = "\n".join(lines)
+        tg_send(msg)
+        sent += 1
+
+    return sent
+
+
+# ---------- main ----------
 def main() -> None:
-    try:
-        rows = fetch_rows_via_dom()
-    except Exception as e:
-        tg_send(f"⚠️ Не удалось прочитать таблицу: <code>{e}</code>")
-        return
+    # 1) читаем текущее
+    rows = fetch_rows_via_dom()
 
-    if not rows:
-        tg_send("⚠️ Таблица пуста или не найдена. Проверьте URL отчёта/доступы.")
-        return
-
+    # 2) прошлое состояние
     prev = load_state()
-    msgs, new_state = detect_changes(prev, rows)
 
-    # отправляем отдельными сообщениями
-    for m in msgs:
-        tg_send(m)
+    # Если стейт пуст — инициализация без алертов, чтобы не спамить «0→X»
+    if not prev:
+        base = {}
+        for r in rows:
+            k = key_for_state(r)
+            base[k] = {
+                "cost": float(r.get("cost") or 0.0),
+                "leads": int(r.get("leads") or 0),
+                "sales": int(r.get("sales") or 0),
+            }
+        save_state(base)
+        # Можно раскомментировать «heartbeat»:
+        # tg_send("✅ База инициализирована. Алерты пойдут со следующего запуска.")
+        return
 
-    # сохраняем состояние (даже если изменений не было)
-    try:
-        save_state(new_state)
-    except Exception:
-        pass
+    # 3) диф
+    changes, new_state = detect_changes(prev, rows)
+
+    # 4) отправка
+    total_sent = send_grouped_messages(changes)
+    if total_sent == 0:
+        tg_send("accs on vacation...")
+
+    # 5) сохранить стейт
+    save_state(new_state)
 
 
 if __name__ == "__main__":
