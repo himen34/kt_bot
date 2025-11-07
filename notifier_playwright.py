@@ -1,6 +1,5 @@
-# notifier_playwright.py — dedup safe: merged state, single midnight reset, per-change alerts
-import os, json, time, re
-from typing import Dict, List
+import os, json, time, re, sys
+from typing import Dict, List, Tuple
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
@@ -24,17 +23,11 @@ GIST_FILENAME = os.getenv("GIST_FILENAME", "keitaro_spend_state.json")
 
 SPEND_DIR = os.getenv("SPEND_DIRECTION", "both").lower()   # up|down|both
 KYIV_TZ   = ZoneInfo(os.getenv("KYIV_TZ", "Europe/Kyiv"))
-EPS = 0.009  # ~1 цент: все вище — реальна зміна
+EPS = 0.009  # ~1 cent
 
-# ===== small utils =====
-def now_kyiv() -> datetime:
-    return datetime.now(KYIV_TZ)
-
-def kyiv_today_str() -> str:
-    return now_kyiv().strftime("%Y-%m-%d")
-
-def fmt_money(x: float) -> str:
-    return f"${x:,.2f}"
+def now_kyiv() -> datetime: return datetime.now(KYIV_TZ)
+def kyiv_today_str() -> str: return now_kyiv().strftime("%Y-%m-%d")
+def fmt_money(x: float) -> str: return f"${x:,.2f}"
 
 def pct(delta: float, base: float) -> float:
     if abs(base) < EPS:
@@ -46,7 +39,7 @@ def direction_ok(delta: float) -> bool:
     if SPEND_DIR == "down": return delta < -EPS
     return abs(delta) > EPS
 
-# ===== state in Gist =====
+# ---------- Gist state ----------
 def load_state() -> Dict:
     url = f"https://api.github.com/gists/{GIST_ID}"
     r = requests.get(url, headers={
@@ -58,24 +51,22 @@ def load_state() -> Dict:
         if GIST_FILENAME in files and "content" in files[GIST_FILENAME]:
             try:
                 return json.loads(files[GIST_FILENAME]["content"])
-            except:
+            except Exception:
                 pass
-    # порожня база
-    return {"date": kyiv_today_str(), "rows": {}}
+    return {"date": kyiv_today_str(), "rows": {}, "sent": {}}
 
-def save_state(state: Dict):
+def save_state(state: Dict) -> Tuple[int, str]:
     url = f"https://api.github.com/gists/{GIST_ID}"
     files = {GIST_FILENAME: {"content": json.dumps(state, ensure_ascii=False, indent=2)}}
     r = requests.patch(url, headers={
         "Authorization": f"Bearer {GIST_TOKEN}",
         "Accept": "application/vnd.github+json"
     }, json={"files": files}, timeout=30)
-    r.raise_for_status()
+    # повернемо код/текст для явного логу
+    return r.status_code, r.reason
 
-# ===== Telegram =====
+# ---------- Telegram ----------
 def tg_send(text: str):
-    if not CHAT_IDS:
-        return
     for cid in CHAT_IDS:
         try:
             requests.post(
@@ -86,22 +77,35 @@ def tg_send(text: str):
         except Exception:
             pass
 
-# ===== Parse helpers =====
+# ---------- Parsing ----------
 def as_float(v):
     try: return float(v or 0)
     except: return 0.0
+
+def norm(s: str) -> str:
+    # обрізаємо пробіли/невидимі символи всередині/по краях
+    if s is None: return ""
+    s = re.sub(r"[\u200b-\u200d\uFEFF]", "", str(s))  # zero-width, etc.
+    return re.sub(r"\s+", " ", s).strip()
+
+def make_key(campaign, sid6, sid5, sid4) -> str:
+    return "|".join([norm(campaign), norm(sid6), norm(sid5), norm(sid4)])
 
 def parse_report_from_json(payload: dict) -> List[Dict]:
     rows = []
     for r in payload.get("rows", []):
         dims = r.get("dimensions", {}) if isinstance(r.get("dimensions"), dict) else {}
         def g(k): return r.get(k) or dims.get(k) or ""
+        camp = norm(g("campaign"))
+        sid6 = norm(g("sub_id_6"))
+        sid5 = norm(g("sub_id_5"))
+        sid4 = norm(g("sub_id_4"))
         rows.append({
-            "k": f"{g('campaign')}|{g('sub_id_6')}|{g('sub_id_5')}|{g('sub_id_4')}",
-            "campaign": str(g("campaign")),
-            "sub_id_6": str(g("sub_id_6")),
-            "sub_id_5": str(g("sub_id_5")),
-            "sub_id_4": str(g("sub_id_4")),
+            "k": make_key(camp, sid6, sid5, sid4),
+            "campaign": camp,
+            "sub_id_6": sid6,
+            "sub_id_5": sid5,
+            "sub_id_4": sid4,
             "cost":  as_float(r.get("cost")),
             "leads": as_float(r.get("leads")),
             "sales": as_float(r.get("sales")),
@@ -146,19 +150,20 @@ def parse_report_from_html(page) -> List[Dict]:
     for tr in target.query_selector_all("tbody tr"):
         tds = tr.query_selector_all("td")
         def safe(i):
-            try: return (tds[i].inner_text() or "").strip()
+            try: return norm(tds[i].inner_text())
             except: return ""
         def to_f(s: str) -> float:
-            s = s.replace("$","").replace(",","").strip()
+            s = (s or "").replace("$","").replace(",","").strip()
             try: return float(s)
             except: return 0.0
 
+        camp, sid6, sid5, sid4 = safe(idx['campaign']), safe(idx['sid6']), safe(idx['sid5']), safe(idx['sid4'])
         rows.append({
-            "k": f"{safe(idx['campaign'])}|{safe(idx['sid6'])}|{safe(idx['sid5'])}|{safe(idx['sid4'])}",
-            "campaign": safe(idx["campaign"]),
-            "sub_id_6": safe(idx["sid6"]),
-            "sub_id_5": safe(idx["sid5"]),
-            "sub_id_4": safe(idx["sid4"]),
+            "k": make_key(camp, sid6, sid5, sid4),
+            "campaign": camp,
+            "sub_id_6": sid6,
+            "sub_id_5": sid5,
+            "sub_id_4": sid4,
             "cost":  to_f(safe(idx["cost"])),
             "leads": to_f(safe(idx["leads"])),
             "sales": to_f(safe(idx["sales"])),
@@ -166,7 +171,6 @@ def parse_report_from_html(page) -> List[Dict]:
         })
     return rows
 
-# ===== Playwright fetch: XHR -> HTML -> ag-Grid =====
 def fetch_rows() -> List[Dict]:
     with sync_playwright() as pw:
         browser = pw.chromium.launch(headless=True, args=["--disable-blink-features=AutomationControlled"])
@@ -203,112 +207,66 @@ def fetch_rows() -> List[Dict]:
         ctx.on("response", on_response)
 
         page.goto(PAGE_URL, wait_until="domcontentloaded")
-        # чек XHR до ~12 сек
         for _ in range(24):
             if captured: break
             time.sleep(0.5)
 
-        rows = []
-        if captured:
-            rows = captured
-        else:
-            # HTML table fallback
+        rows = captured
+        if not rows:
             try:
                 if page.locator("table tbody tr").count() > 0:
                     rows = parse_report_from_html(page)
             except Exception:
                 pass
 
-            # ag-Grid fallback
-            if not rows:
-                try:
-                    rws = page.locator(".ag-center-cols-container .ag-row")
-                    if rws.count() > 0:
-                        headers = [ (h.inner_text() or "").strip().lower()
-                                    for h in page.locator(".ag-header-cell-text").all() ]
-                        def idx(name_variants):
-                            for i, h in enumerate(headers):
-                                for v in name_variants:
-                                    if v in h: return i
-                            return -1
-                        i_campaign = idx(["campaign"])
-                        i_sid6 = idx(["sub id 6","sub_id_6"])
-                        i_sid5 = idx(["sub id 5","sub_id_5"])
-                        i_sid4 = idx(["sub id 4","sub_id_4"])
-                        i_leads  = idx(["leads"])
-                        i_sales  = idx(["sales"])
-                        i_cpa    = idx(["cpa"])
-                        i_cost   = idx(["cost"])
-
-                        def to_f(s: str) -> float:
-                            s = (s or "").replace("$","").replace(",","").strip()
-                            try: return float(s)
-                            except: return 0.0
-
-                        for row in rws.all():
-                            cells = [ (c.inner_text() or "").strip() for c in row.locator(".ag-cell-value").all() ]
-                            def safe(i): 
-                                try: return cells[i]
-                                except: return ""
-                            rows.append({
-                                "k": f"{safe(i_campaign)}|{safe(i_sid6)}|{safe(i_sid5)}|{safe(i_sid4)}",
-                                "campaign": safe(i_campaign),
-                                "sub_id_6": safe(i_sid6),
-                                "sub_id_5": safe(i_sid5),
-                                "sub_id_4": safe(i_sid4),
-                                "cost":  to_f(safe(i_cost)),
-                                "leads": to_f(safe(i_leads)),
-                                "sales": to_f(safe(i_sales)),
-                                "cpa":   to_f(safe(i_cpa)),
-                            })
-                except Exception:
-                    pass
-
         browser.close()
-        return rows
+        return rows or []
 
-# ===== MAIN =====
+# ---------- MAIN ----------
 def main():
     state = load_state()
     prev_date = state.get("date", kyiv_today_str())
     prev_rows = state.get("rows", {})
+    sent      = state.get("sent", {})
     today = kyiv_today_str()
-    now = now_kyiv()
 
     rows = fetch_rows()
-    if not rows:
-        return  # тихо выходим — нечего сравнивать
+    print(f"[info] fetched rows: {len(rows)}", file=sys.stdout)
 
-    # ---- Single midnight reset (перші 30 хв після 00:00)
-    if prev_date != today and (now.hour == 0 and now.minute <= 30):
-        baseline = {r["k"]: r for r in rows}
-        save_state({"date": today, "rows": baseline})
-        # не шлём алерти на baseline
+    if not rows:
         return
 
-    # Зливаємо старий стан з новим (щоб ключі не зникали між циклами)
-    merged_rows: Dict[str, Dict] = dict(prev_rows)
+    # раз у ніч — baseline без алертів
+    if prev_date != today and 0 <= now_kyiv().hour < 1:
+        baseline = {r["k"]: r for r in rows}
+        new_state = {"date": today, "rows": baseline, "sent": {}}
+        code, reason = save_state(new_state)
+        print(f"[save@midnight] status={code} reason={reason} keys={len(baseline)} sample_key={next(iter(baseline)) if baseline else '-'}")
+        return
 
-    # детект і меседжі
+    merged_rows: Dict[str, Dict] = dict(prev_rows)
+    new_sent: Dict[str, Dict] = dict(sent)
+
     blocks: List[str] = []
 
-    # прирости/поява нових
     for r in rows:
         k = r["k"]
         old = prev_rows.get(k)
 
+        # --- compute deltas ---
         if not old:
-            # новий рядок — повідомляємо один раз і додаємо у state,
-            # щоб не повторювати у наступному циклі
-            if r["cost"] > EPS:
-                p = 100.0
+            # новий рядок → але шлемо лише якщо ще НЕ відправляли ці значення
+            last = sent.get(k, {})
+            if r["cost"] > EPS and abs(r["cost"] - last.get("cost", 0.0)) > EPS:
                 blocks.append(
                     "🧊 *SPEND ALERT*\n"
                     f"CAMPAIGN: {r['campaign']}\n"
                     f"SubID5: {r['sub_id_5']}  SubID4: {r['sub_id_4']}\n"
-                    f"Cost: {fmt_money(0)} → {fmt_money(r['cost'])}  (Δ {fmt_money(r['cost'])}, ~{p:.0f}%) 🔺"
+                    f"Cost: {fmt_money(0)} → {fmt_money(r['cost'])}  (Δ {fmt_money(r['cost'])}, ~100%) 🔺"
                 )
-            if r["leads"] > EPS:
+                new_sent.setdefault(k, {})["cost"] = r["cost"]
+
+            if r["leads"] > EPS and int(r["leads"]) != int(last.get("leads", 0)):
                 cpa_part = f"  • CPA: {fmt_money(r['cpa'])}" if r['cpa'] > EPS else ""
                 blocks.append(
                     "🟩 *LEAD ALERT*\n"
@@ -316,29 +274,35 @@ def main():
                     f"SubID5: {r['sub_id_5']}  SubID4: {r['sub_id_4']}\n"
                     f"Leads: 0 → {int(r['leads'])}{cpa_part}"
                 )
-            if r["sales"] > EPS:
+                new_sent.setdefault(k, {})["leads"] = int(r["leads"])
+
+            if r["sales"] > EPS and int(r["sales"]) != int(last.get("sales", 0)):
                 blocks.append(
                     "🟦 *SALE ALERT*\n"
                     f"CAMPAIGN: {r['campaign']}\n"
                     f"SubID5: {r['sub_id_5']}  SubID4: {r['sub_id_4']}\n"
                     f"Sales: 0 → {int(r['sales'])}"
                 )
+                new_sent.setdefault(k, {})["sales"] = int(r["sales"])
+
             merged_rows[k] = r
             continue
 
-        # існуючий рядок — класичні дельти
+        # існуючий рядок
         delta_cost = r["cost"] - old["cost"]
-        if direction_ok(delta_cost):
-            p = pct(delta_cost, old["cost"])
+        last = sent.get(k, {})
+
+        if direction_ok(delta_cost) and abs(r["cost"] - last.get("cost", -1e9)) > EPS:
             arrow = "🔺" if delta_cost > 0 else "🔻"
             blocks.append(
                 "🧊 *SPEND ALERT*\n"
                 f"CAMPAIGN: {r['campaign']}\n"
                 f"SubID5: {r['sub_id_5']}  SubID4: {r['sub_id_4']}\n"
-                f"Cost: {fmt_money(old['cost'])} → {fmt_money(r['cost'])}  (Δ {fmt_money(delta_cost)}, ~{p:.0f}%) {arrow}"
+                f"Cost: {fmt_money(old['cost'])} → {fmt_money(r['cost'])}  (Δ {fmt_money(delta_cost)}, ~{pct(delta_cost, old['cost']):.0f}%) {arrow}"
             )
+            new_sent.setdefault(k, {})["cost"] = r["cost"]
 
-        if r["leads"] - old["leads"] > EPS:
+        if r["leads"] - old["leads"] > EPS and int(r["leads"]) != int(last.get("leads", -10**9)):
             cpa_part = f"  • CPA: {fmt_money(r['cpa'])}" if r['cpa'] > EPS else ""
             blocks.append(
                 "🟩 *LEAD ALERT*\n"
@@ -346,24 +310,26 @@ def main():
                 f"SubID5: {r['sub_id_5']}  SubID4: {r['sub_id_4']}\n"
                 f"Leads: {int(old['leads'])} → {int(r['leads'])}{cpa_part}"
             )
+            new_sent.setdefault(k, {})["leads"] = int(r["leads"])
 
-        if r["sales"] - old["sales"] > EPS:
+        if r["sales"] - old["sales"] > EPS and int(r["sales"]) != int(last.get("sales", -10**9)):
             blocks.append(
                 "🟦 *SALE ALERT*\n"
                 f"CAMPAIGN: {r['campaign']}\n"
                 f"SubID5: {r['sub_id_5']}  SubID4: {r['sub_id_4']}\n"
                 f"Sales: {int(old['sales'])} → {int(r['sales'])}"
             )
+            new_sent.setdefault(k, {})["sales"] = int(r["sales"])
 
-        # оновлюємо state цим рядком — щоб не було дубля на наступному циклі
         merged_rows[k] = r
 
-    # Нічого не змінилося — нічого не шлемо
     if blocks:
         tg_send("\n\n".join(blocks))
 
-    # — зберігаємо ОНОВЛЕНИЙ стан
-    save_state({"date": today, "rows": merged_rows})
+    new_state = {"date": today, "rows": merged_rows, "sent": new_sent}
+    code, reason = save_state(new_state)
+    sample_key = next(iter(merged_rows)) if merged_rows else "-"
+    print(f"[save] status={code} reason={reason} keys={len(merged_rows)} sample_key={sample_key}", file=sys.stdout)
 
 if __name__ == "__main__":
     main()
