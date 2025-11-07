@@ -1,4 +1,4 @@
-# notifier_playwright.py — per-change blocks, 2 TG chats, midnight reset (Europe/Kyiv), new-row as delta from 0, XHR+HTML+agGrid
+# notifier_playwright.py — dedup safe: merged state, single midnight reset, per-change alerts
 import os, json, time, re
 from typing import Dict, List
 from datetime import datetime
@@ -24,7 +24,7 @@ GIST_FILENAME = os.getenv("GIST_FILENAME", "keitaro_spend_state.json")
 
 SPEND_DIR = os.getenv("SPEND_DIRECTION", "both").lower()   # up|down|both
 KYIV_TZ   = ZoneInfo(os.getenv("KYIV_TZ", "Europe/Kyiv"))
-EPS = 0.009  # для float-порівнянь: все > 0.009 вважаємо зміною (0.01$ пройде)
+EPS = 0.009  # ~1 цент: все вище — реальна зміна
 
 # ===== small utils =====
 def now_kyiv() -> datetime:
@@ -60,6 +60,7 @@ def load_state() -> Dict:
                 return json.loads(files[GIST_FILENAME]["content"])
             except:
                 pass
+    # порожня база
     return {"date": kyiv_today_str(), "rows": {}}
 
 def save_state(state: Dict):
@@ -269,33 +270,36 @@ def fetch_rows() -> List[Dict]:
 # ===== MAIN =====
 def main():
     state = load_state()
-    prev_date = state["date"]
-    prev_rows = state["rows"]
+    prev_date = state.get("date", kyiv_today_str())
+    prev_rows = state.get("rows", {})
     today = kyiv_today_str()
+    now = now_kyiv()
 
     rows = fetch_rows()
     if not rows:
-        tg_send("🟥  NOTHING HAPPEND")
-        return
+        return  # тихо выходим — нечего сравнивать
 
-    # midnight reset
-    if prev_date != today:
+    # ---- Single midnight reset (перші 30 хв після 00:00)
+    if prev_date != today and (now.hour == 0 and now.minute <= 30):
         baseline = {r["k"]: r for r in rows}
         save_state({"date": today, "rows": baseline})
-        tg_send("🟥  NOTHING HAPPEND")
+        # не шлём алерти на baseline
         return
 
-    # detect & format
-    new_map: Dict[str, Dict] = {}
+    # Зливаємо старий стан з новим (щоб ключі не зникали між циклами)
+    merged_rows: Dict[str, Dict] = dict(prev_rows)
+
+    # детект і меседжі
     blocks: List[str] = []
 
+    # прирости/поява нових
     for r in rows:
         k = r["k"]
-        new_map[k] = r
         old = prev_rows.get(k)
 
-        # Якщо рядок новий: виводимо зміни від 0 → поточне
         if not old:
+            # новий рядок — повідомляємо один раз і додаємо у state,
+            # щоб не повторювати у наступному циклі
             if r["cost"] > EPS:
                 p = 100.0
                 blocks.append(
@@ -319,10 +323,10 @@ def main():
                     f"SubID5: {r['sub_id_5']}  SubID4: {r['sub_id_4']}\n"
                     f"Sales: 0 → {int(r['sales'])}"
                 )
+            merged_rows[k] = r
             continue
 
         # існуючий рядок — класичні дельти
-        # SPEND
         delta_cost = r["cost"] - old["cost"]
         if direction_ok(delta_cost):
             p = pct(delta_cost, old["cost"])
@@ -334,7 +338,6 @@ def main():
                 f"Cost: {fmt_money(old['cost'])} → {fmt_money(r['cost'])}  (Δ {fmt_money(delta_cost)}, ~{p:.0f}%) {arrow}"
             )
 
-        # LEAD
         if r["leads"] - old["leads"] > EPS:
             cpa_part = f"  • CPA: {fmt_money(r['cpa'])}" if r['cpa'] > EPS else ""
             blocks.append(
@@ -344,7 +347,6 @@ def main():
                 f"Leads: {int(old['leads'])} → {int(r['leads'])}{cpa_part}"
             )
 
-        # SALE
         if r["sales"] - old["sales"] > EPS:
             blocks.append(
                 "🟦 *SALE ALERT*\n"
@@ -353,12 +355,15 @@ def main():
                 f"Sales: {int(old['sales'])} → {int(r['sales'])}"
             )
 
+        # оновлюємо state цим рядком — щоб не було дубля на наступному циклі
+        merged_rows[k] = r
+
+    # Нічого не змінилося — нічого не шлемо
     if blocks:
         tg_send("\n\n".join(blocks))
-    else:
-        tg_send("🟥  NOTHING HAPPEND")
 
-    save_state({"date": today, "rows": new_map})
+    # — зберігаємо ОНОВЛЕНИЙ стан
+    save_state({"date": today, "rows": merged_rows})
 
 if __name__ == "__main__":
     main()
