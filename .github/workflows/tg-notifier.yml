@@ -24,7 +24,7 @@ jobs:
           TELEGRAM_CHAT_ID_2: ${{ secrets.TELEGRAM_CHAT_ID_2 }}
           GIST_ID: ${{ secrets.GIST_ID }}
           GIST_TOKEN: ${{ secrets.GIST_TOKEN }}
-          GIST_FILENAME: keitaro_spend_state.json
+          GIST_FILENAME: keitaro_spend_state1.json
           SPEND_ABS_THRESHOLD: ${{ secrets.SPEND_ABS_THRESHOLD }}
           SPEND_PCT_THRESHOLD: ${{ secrets.SPEND_PCT_THRESHOLD }}
           SPEND_DIRECTION: ${{ secrets.SPEND_DIRECTION }}
