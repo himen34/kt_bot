@@ -493,8 +493,6 @@ def main():
 
     if blocks:
         tg_send("\n\n".join(blocks))
-    else:
-        tg_send("accs on vacation...")
 
     # Сохранить стейт
     save_state({"date": today, "rows": new_map})
